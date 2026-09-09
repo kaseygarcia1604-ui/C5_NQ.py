@@ -1,0 +1,257 @@
+"""
+policy_engine.py -- Motor de autorizacion fail-closed de RiskAval.
+
+RECONSTRUIDO a partir de fragmentos recuperados de la sesion original
+(chat "NQ", 2026-07-09). El nucleo de seguridad (SAFE_FUNCTIONS,
+SAFE_CONSTANTS, PolicyEngineError, _safe_eval, __init__, _rules_for)
+se recupero casi verbatim de esa sesion -- es el codigo ya auditado y
+probado entonces. El cuerpo de evaluate() se reconstruyo de forma
+consistente con los cuatro casos de prueba confirmados en esa misma
+sesion (aprobado en condiciones normales; bloqueado por tamaño de
+posicion; por ventana horaria; por limite de perdida diaria) y con
+los mensajes de razon exactos que aparecieron en las pruebas de
+anonymizer.py de esa sesion.
+
+DISEÑO: fail-closed real, no solo en teoria. Si el YAML tiene un error,
+o una condicion referencia una variable que no existe, el motor NO deja
+pasar la accion -- bloquea automaticamente y guarda el motivo del fallo
+interno como razon. evaluate() nunca lanza una excepcion hacia quien lo
+llama: SIEMPRE devuelve un AuditEntry completo.
+
+NOTA sobre "capacidad vs ejecucion confirmada" (RiskAval, sesion actual):
+este motor NO necesita ese distingo -- cada llamada a evaluate() ya es
+una accion CONCRETA propuesta por el motor de trading, no una lista de
+capacidades teoricas de un agente. La distincion capacidad/ejecucion
+aplica a un agente con un toolset completo eligiendo que tool invocar
+(por eso vive en aval_logger.py / AVAL_agente.py, donde se registra el
+comportamiento de un agente con acceso a multiples acciones), no aqui,
+donde el unico input siempre es ya una accion real en curso.
+"""
+import uuid
+from datetime import time as dtime
+from types import SimpleNamespace
+from typing import Any, Optional
+
+import yaml
+
+from audit_schema import ActionType, AuditEntry, Decision, MarketContext, RiskState
+from authority_calibrator import AuthorityCalibrator, CalibrationResult
+
+# ---------------------------------------------------------------
+# Esta es la UNICA superficie que las condiciones del YAML pueden
+# invocar -- nada mas del interprete de Python esta disponible
+# (ver _safe_eval). Es lo que hace seguro usar eval() aqui.
+# ---------------------------------------------------------------
+def in_trading_window(current_time: dtime, window: dict) -> bool:
+    """
+    Soporta ventanas normales (start < end, ej 09:30-16:00) y ventanas
+    que cruzan medianoche (start > end, ej 22:00-02:00 para sesiones
+    overnight). Sin este chequeo, una ventana overnight nunca coincidia
+    con ninguna hora -- fallaba silenciosamente hacia "siempre fuera de
+    ventana" (bloqueaba de mas, no de menos: no era un riesgo de
+    seguridad, pero si un falso bloqueo dificil de diagnosticar).
+    """
+    start = dtime.fromisoformat(window["start"])
+    end = dtime.fromisoformat(window["end"])
+    if start <= end:
+        return start <= current_time <= end
+    # Ventana cruza medianoche: valido si current_time esta despues de
+    # start O antes de end (ej. 23:00 o 01:00 estan dentro de 22:00-02:00)
+    return current_time >= start or current_time <= end
+
+
+SAFE_FUNCTIONS: dict[str, Any] = {
+    "in_trading_window": in_trading_window,
+}
+
+SAFE_CONSTANTS: dict[str, Any] = {
+    "true": True,
+    "false": False,
+}
+
+
+class PolicyEngineError(Exception):
+    """Se lanza cuando una condicion no puede evaluarse con confianza.
+    Su efecto siempre es fail-closed: bloquear la accion en curso."""
+
+
+class PolicyEngine:
+    def __init__(self, config_path: str, authority_calibrator: Optional[AuthorityCalibrator] = None):
+        """
+        authority_calibrator: opcional. Si se pasa, evaluate() lo usa
+        para calcular calibrated_authority/authority_is_calibrated y
+        los agrega al contexto que las condiciones del YAML pueden leer
+        -- ver authority_calibrator.py para la logica de calibracion
+        (generalizacion de Cerebro._riesgo_kelly()).
+        """
+        with open(config_path, "r", encoding="utf-8") as f:
+            self.config = yaml.safe_load(f)
+
+        if not self.config or "rules" not in self.config:
+            raise PolicyEngineError(f"Config invalida o incompleta en {config_path}")
+
+        if not isinstance(self.config["rules"], dict):
+            raise PolicyEngineError(
+                f"'rules' debe ser un diccionario en {config_path}, "
+                f"recibido: {type(self.config['rules']).__name__}"
+            )
+
+        self.rules_ns = SimpleNamespace(**self.config["rules"])
+        self.account_id_default = self.config.get("account_id", "unknown")
+        self.authority_calibrator = authority_calibrator
+
+    # -----------------------------------------------------------
+    def _safe_eval(self, condition: Optional[str], context: dict[str, Any]) -> bool:
+        """Evalua una condicion de forma restringida: sin builtins,
+        solo las funciones/constantes explicitamente permitidas."""
+        if condition is None:
+            return True  # sin condicion == siempre aplica
+
+        eval_globals = {"__builtins__": {}}
+        eval_globals.update(SAFE_FUNCTIONS)
+        eval_globals.update(SAFE_CONSTANTS)
+
+        eval_locals = dict(context)
+        eval_locals["rules"] = self.rules_ns
+
+        try:
+            return bool(eval(condition, eval_globals, eval_locals))  # noqa: S307
+        except Exception as exc:
+            raise PolicyEngineError(
+                f"No se pudo evaluar la condicion '{condition}': {exc}"
+            ) from exc
+
+    # -----------------------------------------------------------
+    def _rules_for(self, tier_key: str, action_type: str) -> list[dict]:
+        return [
+            rule
+            for rule in self.config.get(tier_key, [])
+            if rule.get("action") == action_type
+        ]
+
+    # -----------------------------------------------------------
+    def evaluate(
+        self,
+        action_type: ActionType,
+        proposed_params: dict,
+        market_context: MarketContext,
+        risk_state: RiskState,
+        agent_id: str,
+        account_id: Optional[str] = None,
+        outcome_history: Optional[list] = None,
+    ) -> AuditEntry:
+        """
+        Punto de entrada unico del motor. SIEMPRE devuelve un AuditEntry
+        completo -- nunca lanza una excepcion hacia el llamador. Cualquier
+        fallo interno se traduce en decision=BLOCKED (fail-closed).
+
+        outcome_history: opcional. Historial de resultados pasados del
+        agente (mismo formato que self.e.trades en KMT: valor > 0 =
+        exito, <= 0 = fallo). Si se pasa Y hay un authority_calibrator
+        configurado, se calcula calibrated_authority/authority_is_calibrated
+        y quedan disponibles en el contexto para cualquier condicion del
+        YAML, ademas de guardarse en el AuditEntry para auditoria.
+        """
+        entry_id = str(uuid.uuid4())
+        account_id = account_id or self.account_id_default
+        action_value = (
+            action_type.value if isinstance(action_type, ActionType) else str(action_type)
+        )
+
+        def _entry(
+            decision: Decision,
+            rule_triggered: Optional[str],
+            reason: str,
+            calibration: Optional[CalibrationResult] = None,
+        ) -> AuditEntry:
+            return AuditEntry(
+                entry_id=entry_id,
+                agent_id=agent_id,
+                account_id=account_id,
+                action_type=action_type,
+                proposed_params=proposed_params,
+                market_context=market_context,
+                risk_state=risk_state,
+                decision=decision,
+                rule_triggered=rule_triggered,
+                reason=reason,
+                calibration_detail=calibration,
+            )
+
+        try:
+            # CRITICO: la calibracion se calcula AQUI DENTRO del try, no
+            # antes. Si authority_calibrator.calibrate() lanza cualquier
+            # excepcion (bug interno, outcome_history corrupto), cae en
+            # el except generico de abajo y BLOQUEA la accion -- nunca
+            # se propaga hacia el llamador. Esto preserva la garantia de
+            # "evaluate() nunca lanza" tambien para la calibracion, no
+            # solo para las reglas del YAML.
+            calibration: Optional[CalibrationResult] = None
+            if self.authority_calibrator is not None and outcome_history is not None:
+                calibration = self.authority_calibrator.calibrate(outcome_history)
+
+            context = {
+                "action": action_value,
+                "params": proposed_params,
+                "current_time": market_context.timestamp.time(),
+                "daily_pnl": risk_state.daily_pnl,
+                "weekly_pnl": risk_state.weekly_pnl,
+                "open_contracts": risk_state.open_contracts,
+                "account_equity": risk_state.account_equity,
+                "atr": market_context.atr,
+                "price": market_context.price,
+                "minutes_to_next_news_event": market_context.minutes_to_next_news_event,
+                # NUEVO: disponibles para cualquier condicion del YAML,
+                # igual que los campos de arriba. None/False si no hay
+                # calibrador o historial -- las condiciones que los usan
+                # deben chequear authority_is_calibrated antes.
+                "calibrated_authority": calibration.calibrated_authority if calibration else None,
+                "authority_is_calibrated": calibration.is_calibrated if calibration else False,
+            }
+
+            # Tier 1: BLOCK -- se revisa primero. Si cualquier regla de
+            # bloqueo aplica, la accion se detiene ahi.
+            for rule in self._rules_for("block", action_value):
+                if self._safe_eval(rule.get("condition"), context):
+                    return _entry(
+                        Decision.BLOCKED,
+                        rule.get("condition"),
+                        rule.get("reason", "Bloqueado por politica de riesgo"),
+                        calibration,
+                    )
+
+            # Tier 2: LOG -- se permite, pero queda marcado para revision.
+            for rule in self._rules_for("log", action_value):
+                if self._safe_eval(rule.get("condition"), context):
+                    return _entry(
+                        Decision.LOGGED,
+                        rule.get("condition"),
+                        rule.get("reason", "Registrado para revision"),
+                        calibration,
+                    )
+
+            # Tier 3: AUTO -- ninguna regla de block ni log aplico.
+            return _entry(
+                Decision.APPROVED,
+                None,
+                "Ninguna politica de bloqueo o log aplico -- autorizado",
+                calibration,
+            )
+
+        except PolicyEngineError as exc:
+            # Fail-closed real: una condicion que no se pudo evaluar con
+            # confianza bloquea la accion, nunca la deja pasar.
+            return _entry(
+                Decision.BLOCKED,
+                None,
+                f"Motor de politicas fallo -- bloqueado por seguridad: {exc}",
+            )
+        except Exception as exc:
+            # Cualquier otro fallo inesperado tambien es fail-closed --
+            # esto AHORA TAMBIEN cubre un fallo dentro de
+            # authority_calibrator.calibrate(), no solo las reglas.
+            return _entry(
+                Decision.BLOCKED,
+                None,
+                f"Error inesperado en el motor -- bloqueado por seguridad: {exc}",
+            )

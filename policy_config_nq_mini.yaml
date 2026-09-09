@@ -1,0 +1,90 @@
+# policy_config_nq_mini.yaml
+# RiskAval -- calibrado para MOTOR_C5_NQ_MINI (ruptura N40, NQ, 1 contrato fijo).
+#
+# Segunda linea de defensa detras de Cerebro._breakers() -- deja el
+# registro de auditoria estructurado que _breakers() no produce.
+#
+# IMPORTANTE: cualquier "condition" que sea un booleano literal debe ir
+# ENTRE COMILLAS ("true", no true).
+
+account_id: "motor-c5-nq-mini-shadow"
+
+rules:
+  # Espejo exacto de CFG["perdida_max_dia"] / CFG["perdida_max_sem"] en
+  # motor_c5_nq_mini.py -- si cambian ahi, actualizar aqui tambien.
+  max_daily_loss: -800
+  max_weekly_loss: -2000
+  # Espejo de CFG["contratos_fijos"]=1 -- NQ mini opera SIEMPRE 1
+  # contrato, sin escalada. Distinto del motor MNQ micro (4).
+  max_contracts: 1
+
+  # Riesgo real en USD por contrato: sl_puntos(12) * usd_punto(20) = 240.
+  # Reemplaza el "400" heredado del motor viejo (que asumia riesgo
+  # variable por ATR) -- en C5 el riesgo por contrato es fijo y exacto.
+  risk_per_contract_usd: 240
+
+  # Sin restriccion horaria -- RUPTURA_N40 se valido explicitamente sin
+  # filtro de hora (24h menos mantenimiento CME, que Cerebro ya maneja
+  # antes de llegar aqui). Ventana totalmente abierta para ser fiel a
+  # lo validado.
+  trading_window:
+    start: "00:00"
+    end: "23:59"
+
+# Tier 1 -- BLOCK
+block:
+  - action: open_position
+    condition: "daily_pnl <= rules.max_daily_loss"
+    reason: "Limite de perdida diaria alcanzado (segunda linea de defensa)"
+
+  - action: open_position
+    condition: "weekly_pnl <= rules.max_weekly_loss"
+    reason: "Limite de perdida semanal alcanzado (segunda linea de defensa)"
+
+  - action: open_position
+    condition: "params.get('contracts', 0) > rules.max_contracts"
+    reason: "Tamano de posicion (orden individual) excede el maximo permitido"
+
+  - action: open_position
+    condition: "(open_contracts + params.get('contracts', 0)) > rules.max_contracts"
+    reason: "Excede exposicion total combinada permitida"
+
+  - action: increase_size
+    condition: "(open_contracts + params.get('contracts', 0)) > rules.max_contracts"
+    reason: "Agregar a una posicion abierta excede la exposicion total permitida"
+
+  - action: open_position
+    condition: "not in_trading_window(current_time, rules.trading_window)"
+    reason: "Fuera de la ventana horaria permitida"
+
+  - action: increase_size
+    condition: "not in_trading_window(current_time, rules.trading_window)"
+    reason: "Fuera de la ventana horaria permitida"
+
+# Tier 2 -- LOG
+log:
+  - action: open_position
+    condition: "daily_pnl <= (rules.max_daily_loss * 0.6)"
+    reason: "Cerca del limite de perdida diaria -- monitorear"
+
+  - action: modify_stop
+    condition: "true"
+    reason: "Modificacion de stop -- registrado para auditoria"
+
+  - action: modify_target
+    condition: "true"
+    reason: "Modificacion de target -- registrado para auditoria"
+
+  - action: close_position
+    condition: "true"
+    reason: "Cierre de posicion -- registrado para auditoria"
+
+  # EN OBSERVACION: compara el riesgo REAL solicitado (contracts *
+  # risk_per_contract_usd, no un numero generico) contra la autoridad
+  # calibrada por Kelly standalone. Cerebro YA NO usa Kelly para
+  # dimensionar (tamano fijo=1) -- esto es puramente informativo/
+  # auditable mientras se observa si el calibrador standalone se aleja
+  # mucho del tamano fijo real que el motor esta usando.
+  - action: open_position
+    condition: "authority_is_calibrated and (params.get('contracts', 0) * rules.risk_per_contract_usd) > calibrated_authority * 1.5"
+    reason: "Riesgo real solicitado excede 1.5x la autoridad calibrada por track record reciente (EN OBSERVACION, informativo -- Cerebro usa tamano fijo)"
