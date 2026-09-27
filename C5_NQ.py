@@ -525,16 +525,78 @@ class Cerebro:
             self._cerrar(p, p.tp, ts, "TP")
             return
 
+    def _hueco_es_esperado(self, ts_antes: pd.Timestamp, ts_despues: pd.Timestamp) -> bool:
+        """FIX (sep 2026, aplicado en MNQ y ahora en NQ): distingue un
+        hueco de tiempo NORMAL (cierre de fin de semana CME, o el
+        mantenimiento diario 17:00-18:00 NY) de una caida real de feed
+        en horario de mercado. Los cierres normales no deben bloquear la
+        deteccion de rupturas -- solo las caidas de feed reales."""
+        antes_ny = ts_antes.tz_convert(NY)
+        despues_ny = ts_despues.tz_convert(NY)
+
+        if antes_ny.weekday() == 4 and antes_ny.time() >= CFG["mantenimiento_ini"]:
+            if despues_ny.weekday() == 6 or despues_ny > antes_ny + timedelta(days=1):
+                return True
+
+        if (antes_ny.time() >= CFG["mantenimiento_ini"] and
+                despues_ny.time() <= CFG["mantenimiento_fin"] and
+                despues_ny.date() == antes_ny.date()):
+            return True
+
+        return False
+
+    def _ventana_tiene_hueco(self, velas_5m: pd.DataFrame) -> bool:
+        """FIX (sep 2026, aplicado en MNQ y ahora en NQ, tras auditoria de
+        trades LIVE): detecta si las ultimas N+1 velas de 5min usadas
+        para el rollmax/rollmin tienen un hueco de tiempo REAL (no un
+        cierre de mercado normal) entre ellas -- misma clase de problema
+        que el bug de rollover de contrato en el backtest, pero causado
+        aqui por caidas/reconexiones del feed en vivo. Si la ventana no
+        es continua Y el hueco no es un cierre esperado (fin de semana /
+        mantenimiento), NO se confia en el rollmax/rollmin."""
+        n = CFG["n_ruptura"]
+        ventana = velas_5m.tail(n + 1)
+        if len(ventana) < 2:
+            return False
+        ts_col = pd.to_datetime(ventana["ts"], utc=True)
+        max_hueco_min = CFG["tf_senal_min"] * 1.5
+        for i in range(1, len(ts_col)):
+            delta_min = (ts_col.iloc[i] - ts_col.iloc[i - 1]).total_seconds() / 60
+            if delta_min > max_hueco_min:
+                if not self._hueco_es_esperado(ts_col.iloc[i - 1], ts_col.iloc[i]):
+                    return True
+        return False
+
     def _detectar_ruptura_5m(self, velas_5m: pd.DataFrame) -> Optional[int]:
         """Ruptura del rango de las N40 velas de 5min ANTERIORES a la
         actual (shift, sin look-ahead). Cooldown de 40 velas misma
-        direccion. Devuelve 1 (alcista), -1 (bajista), o None."""
+        direccion. Devuelve 1 (alcista), -1 (bajista), o None.
+
+        FIX (sep 2026): antes de calcular rollmax/rollmin, verifica que
+        la ventana sea temporalmente continua -- distinguiendo cierres de
+        mercado normales de caidas reales de feed (ver
+        _ventana_tiene_hueco). Sin temporizador fijo: se destraba en
+        cuanto la ventana vuelve a ser continua, ni antes ni despues."""
         n = CFG["n_ruptura"]
         if len(velas_5m) < n + 1:
             return None
+
+        if self._ventana_tiene_hueco(velas_5m):
+            log.warning("Ruptura descartada: la ventana de N40 velas tiene un hueco de "
+                        "tiempo real (feed incompleto) -- rollmax/rollmin no confiable")
+            return None
+
         h = velas_5m["high"].to_numpy()
         l = velas_5m["low"].to_numpy()
         c = velas_5m["close"].to_numpy()
+
+        if len(c) >= 2 and not np.isnan(c[-2]):
+            salto = abs(c[-1] - c[-2])
+            if salto > 100:
+                log.warning(f"Salto de precio inusual entre velas de 5min consecutivas: "
+                            f"{salto:.2f}pts ({c[-2]:.2f} -> {c[-1]:.2f}) -- revisar, "
+                            f"no deberia ocurrir con simbolo continuo")
+
         rollmax = pd.Series(h).rolling(n).max().shift(1).to_numpy()
         rollmin = pd.Series(l).rolling(n).min().shift(1).to_numpy()
         i = len(velas_5m) - 1
