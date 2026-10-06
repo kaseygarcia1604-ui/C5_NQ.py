@@ -1,65 +1,21 @@
 """
-MOTOR C5 NQ_MINI - RUPTURA DE RANGO N40 (5min) -- ESTRATEGIA VALIDADA KELLY 12
+MOTOR C5 NQ_MINI - RUPTURA DE RANGO N40 (5min)
 Databento live -> velas 1min -> velas 5min derivadas -> ruptura N=40 ->
-sizing -> PickMyTrade -> Tradovate/Apex
+PickMyTrade -> Tradovate/Apex
 
-Estrategia validada en Kelly 12 (backtest sobre 397 dias, ene-2025 a jul-2026):
-  - Ruptura del rango de 40 velas de 5min (~200min de historia), ambas
-    direcciones (alcista y bajista)
-  - Entrada a mercado en la vela de 1min siguiente al cierre de la
-    ruptura, TP=30pts / SL=12pts (RR~2.5:1), timeout 15min
-  - n=1,826 eventos, WR=68.7%, PF=4.68, control emparejado +$183/trade
-    (IC95% [$169.87,$198.59], 100% de 200 repeticiones a favor)
-  - Validacion out-of-sample (mitad A elige, mitad B confirma sin
-    reoptimizar): $230.69/trade vs $228.62/trade -- practicamente identico
-  - Desglose direccional: bajista PF=5.51 mas fuerte que alcista PF=4.03,
-    en las tres particiones -- descarta que el edge sea el drift alcista
-    estructural de NQ en este periodo (la misma trampa que invalido ORB,
-    el cruce de apertura, y varios otros candidatos en Kelly 11)
+CAMBIO (6-oct-2026): este servicio conserva el nombre NQ_MINI, su Postgres,
+su cuenta y sus variables de entorno, pero desde esta fecha opera la MISMA
+logica y configuracion que C5_MNQ: MNQ x5, TP=50pts / SL=30pts, timeout
+15min, breaker diario $1,000.
 
-Ver motor_c5_ruptura_n40_spec.md para la tabla completa de numeros.
+Motivo: en vivo, del 2 al 6-oct, las mismas senales dieron +65 pts con
+SL=30 (MNQ) y -22 pts con SL=12 (NQ). El SL de 12 pts se tocaba con el
+ruido normal tras la ruptura. Ampliar el SL en NQ x1 (=MNQ x10) llevaba
+el riesgo a $600 por SL y peores dias de -$3,000, insostenible para una
+cuenta de 50K. MNQ x5 con SL=30 arriesga $300 por SL.
 
-DIFERENCIAS DELIBERADAS respecto al motor anterior (V7_C1, Senal C + F):
-esta es una estrategia distinta, mas simple, y se le quito TODO lo que no
-formo parte de lo validado -- no es un descuido, es la misma disciplina
-que se aplico durante la investigacion (no operar logica sin control
-emparejado):
-  - SIN trailing / reduccion parcial / deteccion de reversion (todo el
-    sistema ATR-based del motor anterior). Salida binaria: TP, SL, o
-    timeout a 15min. Nada mas.
-  - SIN Volume Profile / delta / Senal F -- esta senal usa unicamente
-    OHLC de velas de 5min, no order flow. El feed ya no necesita
-    clasificar compra/venta por tick.
-  - SIN filtro de noticias, SIN correlacion con ES, SIN regimen de
-    volatilidad -- ninguno formo parte del backtest validado (se probo
-    explicitamente SIN filtro de hora ni de regimen).
-  - SIN restriccion horaria -- igual que se valido (rupturas en
-    cualquier momento del dia, sin filtrar sesion).
-
-REUTILIZADO tal cual del motor anterior (infraestructura de produccion,
-no logica de estrategia): Telegram, DB/Postgres, kill switch via
-Telegram, watchdog de feed muerto, Ejecutor con PolicyEngine (RiskAval)
-como segunda linea de defensa, AuthorityCalibrator para Kelly, patron
-productor-consumidor del Feed, y los 3 fixes criticos de sincronizacion
-con el broker (exit->flat, actualizar_stop real, _cerrar_total que no
-marca cerrado si el broker rechaza).
-
-TAMANO FIJO, SIN KELLY: replica exacto lo que se valido en backtest (1
-contrato equivalente todo el tiempo, sin escalada). El
-AuthorityCalibrator se sigue construyendo y pasando al PolicyEngine
-(RiskAval sigue evaluando cada entrada como segunda linea de defensa),
-pero el SIZING en si ya no depende de el -- contratos_fijos=1 siempre.
-Esta es la variante NQ MINI (1 contrato de NQ, riesgo real $240/trade
-con SL=12pts). Existe una variante hermana MNQ MICRO (4 contratos de
-MNQ, riesgo real $96/trade) corriendo en paralelo, en un Postgres y
-proceso de Railway separados, para comparar el desempeno de cada una
-en shadow antes de decidir cual llevar a real.
-
-INSTRUMENTO: NQ (symbol_exec="NQ1!", usd_punto=20.0) -- es el que se
-valido con el resultado mas fuerte (PF=4.68) y es exactamente lo que se
-lleva a real, sin cambios. spread_puntos_ny=0.375 y
-spread_puntos_overnight=0.875 son los mismos valores de costos usados
-en verificacion_ruptura_n40_costos.py durante la validacion.
+Los trades de NQ anteriores al 6-oct-2026 quedan en la misma base de
+datos (trades_live); separarlos por fecha al analizar.
 
 Variables de entorno: DATABASE_URL, DATABENTO_API_KEY, PICKMYTRADE_WEBHOOK,
                       PICKMYTRADE_TOKEN, PICKMYTRADE_ACCOUNT, MODO_SHADOW,
@@ -84,11 +40,11 @@ from authority_calibrator import AuthorityCalibrator
 # CONFIG -- unicamente los parametros de RUPTURA_N40 validado
 # ============================================================
 CFG = {
-    # -------- INSTRUMENTO: NQ -- el validado (PF=4.68, mas fuerte que MNQ PF=3.24) --------
-    "symbol_db": "NQ.c.0",        # simbolo continuo para Databento
-    "symbol_exec": "NQ1!",        # simbolo de ejecucion en PickMyTrade/Tradovate
+    # -------- INSTRUMENTO: MNQ --------
+    "symbol_db": "MNQ.c.0",       # simbolo continuo para Databento
+    "symbol_exec": "MNQ1!",       # simbolo de ejecucion en PickMyTrade/Tradovate
     "dataset": "GLBX.MDP3",
-    "usd_punto": 20.0,            # $/punto de NQ
+    "usd_punto": 2.0,             # $/punto de MNQ
 
     # -------- SENAL: ruptura del rango de N40 velas de 5min --------
     "tf_senal_min": 5,
@@ -96,19 +52,35 @@ CFG = {
     "cooldown_velas_5m": 40,       # no repetir senal misma direccion antes de esto
 
     # -------- ENTRADA / SALIDA (EXACTO al backtest validado) --------
-    "tp_puntos": 30,
-    "sl_puntos": 12,
+    "tp_puntos": 50,
+    "sl_puntos": 30,
     "limite_minutos": 15,          # timeout: cierra a mercado si no toco TP ni SL
-    "contratos_fijos": 1,           # SIN Kelly -- tamano fijo, siempre 1 mini de NQ
+    "contratos_fijos": 5,           # SIN Kelly -- tamano fijo, siempre 5 micros de MNQ
+                                     # Historial de escalado (riesgo real medido con
+                                     # analisis_drawdown_mnq_sl_ancho.py, TP=50/SL=30):
+                                     #   2 contratos: drawdown max -$526.50, peor dia
+                                     #     -$336, peor racha -$415
+                                     #   4 contratos: drawdown max -$1,053, peor dia
+                                     #     -$672, peor racha -$830
+                                     #   5 contratos: drawdown max -$1,316.25, peor dia
+                                     #     -$840 (2026-06-17), peor racha -$1,038
+                                     # El peor dia a 5 contratos (-$840) superaba el
+                                     # breaker diario que estaba en $800 -- por eso
+                                     # perdida_max_dia se subio a $1,000 junto con este
+                                     # cambio, para que el breaker vuelva a tener margen
+                                     # real sobre el peor escenario ya visto en backtest.
+                                     # Desde 6-oct-2026 este servicio (NQ_MINI) corre
+                                     # esta misma config de MNQ x5.
 
     # -------- Cuenta y riesgo --------
     "capital": 50_000,
     "riesgo_trade": 400,
     "riesgo_minimo_dolares": 400,
-    "perdida_max_dia": 800,
+    "perdida_max_dia": 1000,        # subido de 800 -> 1000 junto con el escalado a 5
+                                     # contratos (ver nota en contratos_fijos arriba)
     "perdida_max_sem": 2000,
 
-    # -------- Kelly dinamico -- ver ADVERTENCIA en el docstring --------
+    # -------- Kelly dinamico (informativo -- NO dimensiona el sizing real) --------
     "kelly_fraccion": 0.50,
     "kelly_min_trades": 30,
     "kelly_ventana": 50,
@@ -117,11 +89,8 @@ CFG = {
 
     # -------- Costos reales -- DEBEN coincidir con lo validado --------
     "comision_por_contrato_rt": 1.25,
-    "spread_puntos_ny": 0.375,
-    "spread_puntos_overnight": 0.875,   # confirmado: 0.375 * (3.5/1.5), misma razon
-                                          # spread_puntos_overnight/spread_puntos_ny
-                                          # que el motor V7_C1 (1.5/3.5) -- consistente
-                                          # con lo usado en la validacion de Kelly 12
+    "spread_puntos_ny": 1.5,
+    "spread_puntos_overnight": 3.5,     # identicos al motor V7_C1 -- valores reales de MNQ
     "hora_ny_inicio": dtime(9, 30),
     "hora_ny_fin": dtime(16, 0),
 
@@ -129,7 +98,7 @@ CFG = {
     "mantenimiento_fin": dtime(18, 0),
 
     # -------- RiskAval --------
-    "policy_config_path": "policy_config_nq_mini.yaml",
+    "policy_config_path": "policy_config_mnq_micro.yaml",
 }
 NY = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
@@ -526,40 +495,63 @@ class Cerebro:
             return
 
     def _hueco_es_esperado(self, ts_antes: pd.Timestamp, ts_despues: pd.Timestamp) -> bool:
-        """FIX (sep 2026, aplicado en MNQ y ahora en NQ): distingue un
-        hueco de tiempo NORMAL (cierre de fin de semana CME, o el
-        mantenimiento diario 17:00-18:00 NY) de una caida real de feed
-        en horario de mercado. Los cierres normales no deben bloquear la
-        deteccion de rupturas -- solo las caidas de feed reales."""
-        antes_ny = ts_antes.tz_convert(NY)
-        despues_ny = ts_despues.tz_convert(NY)
+        """Distingue un cierre NORMAL de CME (diario 17:00-18:00 NY, o
+        fin de semana viernes 17:00 -> domingo 18:00) de una caida real
+        de feed.
 
-        if antes_ny.weekday() == 4 and antes_ny.time() >= CFG["mantenimiento_ini"]:
-            if despues_ny.weekday() == 6 or despues_ny > antes_ny + timedelta(days=1):
-                return True
+        FIX (oct 2026):
+          1. Las velas se etiquetan por su INICIO: la ultima vela antes
+             del cierre es 16:55, que termina a las 17:00. Se compara el
+             FIN de la vela, no su inicio (el bug bloqueaba ~200 min de
+             rupturas tras cada reapertura).
+          2. Tolerancia: si la primera vela tras la reapertura llega a
+             las 18:05 o 18:10 (sin trades en el primer bloque), sigue
+             siendo un cierre normal.
+          3. Horas construidas por fecha en NY, no sumando horas, para
+             que los cambios de horario (marzo/noviembre) no lo rompan."""
+        tf = timedelta(minutes=CFG["tf_senal_min"])
+        tol = tf * 3
+        fin_antes = ts_antes.tz_convert("America/New_York") + tf
+        despues = ts_despues.tz_convert("America/New_York")
 
-        if (antes_ny.time() >= CFG["mantenimiento_ini"] and
-                despues_ny.time() <= CFG["mantenimiento_fin"] and
-                despues_ny.date() == antes_ny.date()):
+        def _ny(fecha, hora):
+            return pd.Timestamp(datetime.combine(fecha, hora)).tz_localize("America/New_York")
+
+        cierre = _ny(fin_antes.date(), CFG["mantenimiento_ini"])          # 17:00 de ese dia
+        if not (cierre - tol <= fin_antes <= cierre):
+            return False
+
+        # Cierre diario (lun-jue): reabre 18:00 el mismo dia
+        reapertura = _ny(fin_antes.date(), CFG["mantenimiento_fin"])
+        if reapertura <= despues <= reapertura + tol:
             return True
+
+        # Cierre semanal: viernes 17:00 -> domingo 18:00
+        if fin_antes.weekday() == 4:
+            reap_dom = _ny(fin_antes.date() + timedelta(days=2), CFG["mantenimiento_fin"])
+            if reap_dom <= despues <= reap_dom + tol:
+                return True
 
         return False
 
     def _ventana_tiene_hueco(self, velas_5m: pd.DataFrame) -> bool:
-        """FIX (sep 2026, aplicado en MNQ y ahora en NQ, tras auditoria de
-        trades LIVE): detecta si las ultimas N+1 velas de 5min usadas
-        para el rollmax/rollmin tienen un hueco de tiempo REAL (no un
-        cierre de mercado normal) entre ellas -- misma clase de problema
-        que el bug de rollover de contrato en el backtest, pero causado
-        aqui por caidas/reconexiones del feed en vivo. Si la ventana no
-        es continua Y el hueco no es un cierre esperado (fin de semana /
-        mantenimiento), NO se confia en el rollmax/rollmin."""
+        """FIX (sep 2026, tras auditoria de trades LIVE): detecta si las
+        ultimas N+1 velas de 5min usadas para el rollmax/rollmin tienen un
+        hueco de tiempo REAL (no un cierre de mercado normal) entre ellas
+        -- misma clase de problema que el bug de rollover de contrato en
+        el backtest (un salto de precio no representativo de un
+        movimiento real disparando una ruptura falsa), pero causado aqui
+        por caidas/reconexiones del feed en vivo (confirmadas en
+        produccion: perdida de ticks parciales, corte de ~25h el
+        12-sep-2026). Si la ventana no es continua Y el hueco no es un
+        cierre esperado (fin de semana / mantenimiento), NO se confia en
+        el rollmax/rollmin -- se descarta la deteccion de esa vela."""
         n = CFG["n_ruptura"]
         ventana = velas_5m.tail(n + 1)
         if len(ventana) < 2:
             return False
         ts_col = pd.to_datetime(ventana["ts"], utc=True)
-        max_hueco_min = CFG["tf_senal_min"] * 1.5
+        max_hueco_min = CFG["tf_senal_min"] * 1.5  # tolera jitter normal, no huecos reales
         for i in range(1, len(ts_col)):
             delta_min = (ts_col.iloc[i] - ts_col.iloc[i - 1]).total_seconds() / 60
             if delta_min > max_hueco_min:
@@ -574,9 +566,18 @@ class Cerebro:
 
         FIX (sep 2026): antes de calcular rollmax/rollmin, verifica que
         la ventana sea temporalmente continua -- distinguiendo cierres de
-        mercado normales de caidas reales de feed (ver
-        _ventana_tiene_hueco). Sin temporizador fijo: se destraba en
-        cuanto la ventana vuelve a ser continua, ni antes ni despues."""
+        mercado normales (fin de semana, mantenimiento) de caidas reales
+        de feed (ver _ventana_tiene_hueco). Sin este chequeo, el motor
+        puede confundir un salto de precio causado por datos faltantes
+        con una ruptura real -- exactamente el patron que la auditoria de
+        trades en vivo encontro (6 de 8 entradas limpias sin ruptura real
+        confirmada contra datos completos de Databento).
+
+        No hay temporizador fijo de espera: en cuanto la ventana de N40
+        velas vuelve a ser continua (naturalmente, apenas se acumulan
+        datos limpios), la deteccion se reactiva sola -- no antes, porque
+        no se puede evaluar con menos de 200min de historia real, pero
+        tampoco despues, porque no hace falta esperar mas que eso."""
         n = CFG["n_ruptura"]
         if len(velas_5m) < n + 1:
             return None
@@ -590,6 +591,13 @@ class Cerebro:
         l = velas_5m["low"].to_numpy()
         c = velas_5m["close"].to_numpy()
 
+        # AVISO (no bloqueante): salto de precio anormal entre cierres
+        # consecutivos de 5min. El motor usa el simbolo continuo de
+        # Databento (MNQ.c.0), que ya ajusta el rollover de contrato
+        # automaticamente -- esto NUNCA deberia dispararse por un cambio
+        # de contrato real. Es una alerta de visibilidad por si acaso,
+        # no un fix a un bug conocido (el rollover solo afectaba a los
+        # CSV crudos historicos del backtest, no a este feed en vivo).
         if len(c) >= 2 and not np.isnan(c[-2]):
             salto = abs(c[-1] - c[-2])
             if salto > 100:
@@ -757,6 +765,11 @@ class Feed:
             self.tg.enviar(f"\u26a0\ufe0f Reconexion del feed: se perdieron {len(self.buf)} ticks parciales de vela en curso")
         self.buf = []
         self.vela_ini = None
+        # NOTA: ya no hace falta marcar un timestamp de "calentamiento" --
+        # Cerebro._ventana_tiene_hueco() detecta directamente, en cada
+        # evaluacion, si la ventana de 40 velas todavia contiene el hueco
+        # dejado por esta reconexion. Se autocorrige apenas la ventana
+        # vuelve a ser continua, sin esperar mas ni menos de lo necesario.
 
     def tick(self, ts, price, size):
         ini = ts.replace(second=0, microsecond=0)
