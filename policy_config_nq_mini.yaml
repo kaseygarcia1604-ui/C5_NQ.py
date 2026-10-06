@@ -1,5 +1,5 @@
-# policy_config_nq_mini.yaml
-# RiskAval -- calibrado para MOTOR_C5_NQ_MINI (ruptura N40, NQ, 1 contrato fijo).
+# policy_config_mnq_micro.yaml
+# RiskAval -- calibrado para MOTOR_C5_MNQ_MICRO (ruptura N40, MNQ, 5 contratos fijos).
 #
 # Segunda linea de defensa detras de Cerebro._breakers() -- deja el
 # registro de auditoria estructurado que _breakers() no produce.
@@ -7,21 +7,23 @@
 # IMPORTANTE: cualquier "condition" que sea un booleano literal debe ir
 # ENTRE COMILLAS ("true", no true).
 
-account_id: "motor-c5-nq-mini-shadow"
+account_id: "motor-c5-mnq-micro-live"
 
 rules:
   # Espejo exacto de CFG["perdida_max_dia"] / CFG["perdida_max_sem"] en
-  # motor_c5_nq_mini.py -- si cambian ahi, actualizar aqui tambien.
-  max_daily_loss: -800
+  # motor_c5_mnq_micro.py -- si cambian ahi, actualizar aqui tambien.
+  # Subido de 800 -> 1000 junto con el escalado a 5 contratos: el peor
+  # dia historico a 5 contratos (-$840, ver analisis_drawdown_mnq_sl_ancho.py)
+  # ya superaba el breaker anterior de 800.
+  max_daily_loss: -1000
   max_weekly_loss: -2000
-  # Espejo de CFG["contratos_fijos"]=1 -- NQ mini opera SIEMPRE 1
-  # contrato, sin escalada. Distinto del motor MNQ micro (4).
-  max_contracts: 1
+  # Espejo de CFG["contratos_fijos"]=5 -- MNQ micro opera SIEMPRE 5
+  # contratos, sin escalada. Historial: 2 -> 4 (nunca desplegado) -> 5.
+  max_contracts: 5
 
-  # Riesgo real en USD por contrato: sl_puntos(12) * usd_punto(20) = 240.
-  # Reemplaza el "400" heredado del motor viejo (que asumia riesgo
-  # variable por ATR) -- en C5 el riesgo por contrato es fijo y exacto.
-  risk_per_contract_usd: 240
+  # Riesgo real en USD por contrato: sl_puntos(30) * usd_punto(2) = 60.
+  # No cambia con el numero de contratos -- es el riesgo POR contrato.
+  risk_per_contract_usd: 60
 
   # Sin restriccion horaria -- RUPTURA_N40 se valido explicitamente sin
   # filtro de hora (24h menos mantenimiento CME, que Cerebro ya maneja
@@ -82,7 +84,7 @@ log:
   # EN OBSERVACION: compara el riesgo REAL solicitado (contracts *
   # risk_per_contract_usd, no un numero generico) contra la autoridad
   # calibrada por Kelly standalone. Cerebro YA NO usa Kelly para
-  # dimensionar (tamano fijo=1) -- esto es puramente informativo/
+  # dimensionar (tamano fijo=5) -- esto es puramente informativo/
   # auditable mientras se observa si el calibrador standalone se aleja
   # mucho del tamano fijo real que el motor esta usando.
   - action: open_position
